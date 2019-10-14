@@ -1,10 +1,13 @@
 
-
+# Data and wrangling
 library(quantmod)
 library(tidyverse)
+library(lubridate)
+
+# Forecast
 library(forecast)
-library(forecastHybrid)
-library(caret)
+# library(forecastHybrid)
+# library(caret)
 
 # Paralell
 library(foreach)
@@ -12,6 +15,126 @@ library(doParallel)
 library(parallel)
 
 getSymbols('UNRATE', src='FRED')
+getSymbols('ICSA', src = 'FRED')
+
+
+# -------------------------------------------------------------------------
+
+ur <- UNRATE %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "date") %>% 
+  as_tibble() %>% 
+  mutate(date = as.Date(date))
+
+icsa <- ICSA %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "date") %>% 
+  as_tibble()
+
+
+# -------------------------------------------------------------------------
+# Skv. https://www.census.gov/programs-surveys/cps/technical-documentation/methodology/collecting-data.html
+# er interview week sú vika sem inniheldur 12 hvers mánaðar er sú vika sem könnunin fer fram
+# Nota þær upplýsingar til að filtera út alla dagsetningar um eða undir 
+
+dags_vika_12 <- seq.Date(from = as.Date(icsa$date[1]),
+                         to = as.Date(tail(icsa$date, 1)),
+                         by = "day")
+
+df_dags <- tibble(date = dags_vika_12) %>% 
+  mutate(vika = week(date),
+         ar_vika = paste0(year(date),"-", vika)) %>% 
+  filter(day(date) == 12)
+
+
+
+# -------------------------------------------------------------------------
+
+icsa <- icsa %>% 
+  mutate(date = as.Date(date),
+         vika = week(date),
+         ar_vika = paste0(year(date), "-", vika))
+
+icsa <- icsa %>% 
+  filter(ar_vika %in% df_dags$ar_vika)
+
+icsa <- icsa %>% 
+  mutate(date = floor_date(date, "month"))
+
+
+ur <- ur %>% 
+  left_join(icsa) %>% 
+  na.omit()
+
+
+# -------------------------------------------------------------------------
+
+# unemployment
+ur_ts <- ts(ur$UNRATE,
+            start = 1967,
+            frequency = 12)
+
+ur_train <- window(ur_ts,
+                   end = c(2016, 12))
+
+ur_test <- window(ur_ts,
+                  start = c(2017, 1))
+
+  
+# initial claims
+init_ts <- ts(ur$ICSA,
+              start = 1967,
+              frequency = 12)
+
+
+init_train <- window(init_ts,
+                     end = c(2016, 12))
+
+init_test <- window(init_ts,
+                    start = c(2017, 1))
+
+
+# Fyrir out of sample spána í lokin
+init_total <- ts(icsa$ICSA,
+                 start = 1967,
+                 frequency = 12)
+
+# Líkan -------------------------------------------------------------------
+
+arima_ur_xreg <- auto.arima(ur_train,
+                       xreg = init_train,
+                       stepwise = FALSE)
+
+arima_ur <- auto.arima(ur_train,
+                       stepwise = FALSE)
+
+# ARIMAX virðist nákvæmara.
+accuracy(arima_ur_xreg)
+accuracy(arima_ur)
+
+
+# Out of sample fyrir september
+
+arima_xreg_full <- auto.arima(head(ur_ts, -1),
+                              xreg = head(init_ts, -1),
+                              stepwise = FALSE,
+                              approximation = FALSE)
+
+arima_full <- auto.arima(head(ur_ts, -1),
+                         stepwise = FALSE,
+                         approximation = FALSE)
+
+ets_full <- ets(head(ur_ts, -1))
+
+arima_xreg_full %>% 
+  forecast(h = 1, xreg = tail(init_total, 1))
+
+arima_full %>% 
+  forecast(h = 1)
+
+ets_full %>% 
+  forecast(h = 1)
+
 
 # -------------------------------------------------------------------------
 
@@ -35,120 +158,4 @@ getSymbols('UNRATE', src='FRED')
 # ets_fit %>% forecast(h = 12) %>% autoplot(include = 100)
 
 
-
-
 # -------------------------------------------------------------------------
-
-
-obs <- seq(100, 500, 50)
-train_obs <- 1:max(obs)
-val_obs <- (max(train_obs) + 1):(nrow(UNRATE) - 18) # Nota 18 í test set
-
-max_obs <- max(obs)
-
-spa <- matrix(NA, ncol = length(obs), nrow = length(val_obs))
-loop_list <- list()
-
-
-
-kjarnar <- parallel::detectCores() - 2
-registerDoParallel(cores = kjarnar)
-
-byrja <- Sys.time()
-
-# Loop
-loop_list <- foreach(i = seq_along(val_obs), .packages = c("forecast")) %dopar% {
-  gogn_loop <- UNRATE$UNRATE[i:(i + max_obs)]
-
-  for(j in seq_along(obs)) {
-    gogn_inner_loop <- tail(gogn_loop, obs[j])
-    ts_inner <- ts(gogn_inner_loop, frequency = 12)
-
-    fit <- auto.arima(ts_inner,
-                      stepwise = FALSE)
-
-    fc <- forecast(fit, h = 1)$mean
-
-    spa[i, j] <- fc
-  }
-  return(spa)
-}
-
-Sys.time() - byrja
-
-doParallel::stopImplicitCluster()
-
-
-
-spa_for <- matrix(NA, ncol = length(obs), nrow = length(val_obs))
-
-byrja <- Sys.time()
-
-for(i in seq_along(val_obs)) {
-  gogn_loop <- UNRATE$UNRATE[i:(i + max_obs)]
-    
-    for(j in seq_along(obs)) {
-      gogn_inner_loop <- tail(gogn_loop, obs[j])
-      ts_inner <- ts(gogn_inner_loop, frequency = 12)
-      
-      fit <- auto.arima(ts_inner,
-                        stepwise = FALSE)
-      
-      fc <- forecast(fit, h = 1)$mean
-      
-      spa_for[i, j] <- fc
-  }
-}
-
-Sys.time() - byrja
-
-# 5.8 klst 
-
-
-saveRDS(spa_for, "spa_obs.rds")
-
-
-# Accuracy
-
-gogn_val <- UNRATE$UNRATE[(val_obs + 1), ] %>% as.data.frame()
-gogn_val <- gogn_val %>% rownames_to_column(var = "date")
-df_spa <- as.data.frame(spa_for) %>% as_tibble()
-colnames(df_spa) <- paste0("obs_", obs)
-
-df_spa$raun <- gogn_val$UNRATE
-df_spa$date <- gogn_val$date
-
-df_rmse <- df_spa %>% 
-  pivot_longer(cols = starts_with("obs"),
-               values_to = "gildi",
-               names_to = "obs") %>% 
-  group_by(obs) %>% 
-  summarise(rmse = RMSE(gildi, raun))
-
-
-# out of sample
-
-ur_train <- head(UNRATE, -18) %>%
-  as.data.frame() %>% 
-  rownames_to_column(var = "date") %>% 
-  as_tibble()
-
-ur_test <- tail(UNRATE, 18) %>% 
-  as.data.frame() %>% 
-  rownames_to_column(var = "date") %>% 
-  as_tibble()
-
-ur_train_ts <- ts(ur_train$UNRATE, frequency = 12)
-
-fit_500 <- auto.arima(ur_train_ts,
-                      stepwise = FALSE)
-
-fc_500 <- forecast(fit_500,
-                   h = 18)
-
-fc_500 %>% 
-  autoplot(include = 20) %>% 
-  autolayer(UNRATE, series = ur_test)
-
-plot(fc_500$mean, type = "l")
-lines(ur_test$UNRATE, col = "red")
